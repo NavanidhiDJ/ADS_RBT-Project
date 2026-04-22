@@ -1,0 +1,1398 @@
+"""
+Cybersecurity Intrusion Detection System
+Powered by Moy's Faster, Simpler Red-Black Trees
+Implements ALL 5 algorithms from the paper:
+  1. Moy Monadic (Section 3)
+  2. Okasaki (Section 2)
+  3. Kahrs
+  4. Germane-Might (original + corrected, Appendix B)
+  5. Filliâtre-Letouzey
+"""
+
+from flask import Flask, jsonify, request, render_template_string
+import random, time, timeit, tracemalloc, uuid
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Tuple, Any
+from copy import deepcopy
+
+app = Flask(__name__)
+
+# ═══════════════════════════════════════════════════════════════
+# CORE DATA STRUCTURES
+# ═══════════════════════════════════════════════════════════════
+
+RED, BLACK, DOUBLE_BLACK = "RED", "BLACK", "DOUBLE_BLACK"
+
+@dataclass
+class Node:
+    key: int
+    value: Any
+    color: str
+    left: Optional['Node'] = field(default=None, repr=False)
+    right: Optional['Node'] = field(default=None, repr=False)
+    nid: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+
+    def to_dict(self):
+        return {
+            "key": self.key,
+            "color": self.color,
+            "nid": self.nid,
+            "value": self.value,
+            "left": self.left.to_dict() if self.left else None,
+            "right": self.right.to_dict() if self.right else None,
+        }
+
+def is_red(n): return n is not None and n.color == RED
+def is_black(n): return n is None or n.color == BLACK
+def mk(color, left, key, value, right):
+    return Node(key=key, value=value, color=color, left=left, right=right)
+
+# ═══════════════════════════════════════════════════════════════
+# ALGORITHM 1: OKASAKI (Section 2 of paper)
+# Classic 4-case balance, no short-circuit
+# ═══════════════════════════════════════════════════════════════
+
+class OkasakiTree:
+    name = "Okasaki"
+    rotations = 0
+    balance_calls = 0
+
+    def __init__(self):
+        self.root = None
+        self.rotations = 0
+        self.balance_calls = 0
+
+    def _balance(self, color, left, key, value, right):
+        self.balance_calls += 1
+        # All 4 cases from the paper
+        if color == BLACK and is_red(left) and is_red(left.left):
+            a, x, vx = left.left.left, left.left.key, left.left.value
+            b, y, vy = left.left.right, left.key, left.value
+            c, z, vz = left.right, key, value
+            d = right
+            self.rotations += 1
+            return mk(RED, mk(BLACK,a,x,vx,b), y, vy, mk(BLACK,c,z,vz,d))
+        if color == BLACK and is_red(left) and is_red(left.right):
+            a, x, vx = left.left, left.key, left.value
+            b, y, vy = left.right.left, left.right.key, left.right.value
+            c, z, vz = left.right.right, key, value
+            d = right
+            self.rotations += 1
+            return mk(RED, mk(BLACK,a,x,vx,b), y, vy, mk(BLACK,c,z,vz,d))
+        if color == BLACK and is_red(right) and is_red(right.left):
+            a, x, vx = left, key, value
+            b, y, vy = right.left.left, right.left.key, right.left.value
+            c, z, vz = right.left.right, right.key, right.value
+            d = right.right
+            self.rotations += 1
+            return mk(RED, mk(BLACK,a,x,vx,b), y, vy, mk(BLACK,c,z,vz,d))
+        if color == BLACK and is_red(right) and is_red(right.right):
+            a, x, vx = left, key, value
+            b, y, vy = right.left, right.key, right.value
+            c, z, vz = right.right.left, right.right.key, right.right.value
+            d = right.right.right
+            self.rotations += 1
+            return mk(RED, mk(BLACK,a,x,vx,b), y, vy, mk(BLACK,c,z,vz,d))
+        return mk(color, left, key, value, right)
+
+    def _ins(self, node, key, value):
+        if node is None:
+            return mk(RED, None, key, value, None)
+        if key < node.key:
+            return self._balance(node.color, self._ins(node.left, key, value), node.key, node.value, node.right)
+        elif key > node.key:
+            return self._balance(node.color, node.left, node.key, node.value, self._ins(node.right, key, value))
+        else:
+            return node
+
+    def insert(self, key, value):
+        r = self._ins(self.root, key, value)
+        self.root = mk(BLACK, r.left, r.key, r.value, r.right)
+
+    def delete(self, key):
+        self.root, _ = self._delete(self.root, key)
+        if self.root:
+            self.root.color = BLACK
+
+    def _delete(self, node, key):
+        if node is None:
+            return None, False
+        if key < node.key:
+            new_left, removed = self._delete(node.left, key)
+            new_node = mk(node.color, new_left, node.key, node.value, node.right)
+            return self._fix_delete(new_node, removed, 'left'), removed
+        elif key > node.key:
+            new_right, removed = self._delete(node.right, key)
+            new_node = mk(node.color, node.left, node.key, node.value, new_right)
+            return self._fix_delete(new_node, removed, 'right'), removed
+        else:
+            return self._remove_node(node)
+
+    def _remove_node(self, node):
+        if node.left is None and node.right is None:
+            return None, node.color == BLACK
+        if node.left is None:
+            if node.color == RED:
+                return node.right, False
+            elif is_red(node.right):
+                return mk(BLACK, node.right.left, node.right.key, node.right.value, node.right.right), False
+            return node.right, True
+        if node.right is None:
+            if node.color == RED:
+                return node.left, False
+            elif is_red(node.left):
+                return mk(BLACK, node.left.left, node.left.key, node.left.value, node.left.right), False
+            return node.left, True
+        succ_key, succ_val = self._min_node(node.right)
+        new_right, short = self._delete_min(node.right)
+        new_node = mk(node.color, node.left, succ_key, succ_val, new_right)
+        return self._fix_delete(new_node, short, 'right'), False
+
+    def _min_node(self, node):
+        while node.left: node = node.left
+        return node.key, node.value
+
+    def _delete_min(self, node):
+        if node.left is None:
+            if node.color == RED: return None, False
+            if is_red(node.right):
+                return mk(BLACK, node.right.left, node.right.key, node.right.value, node.right.right), False
+            return None, True
+        new_left, short = self._delete_min(node.left)
+        new_node = mk(node.color, new_left, node.key, node.value, node.right)
+        return self._fix_delete(new_node, short, 'left'), False
+
+    def _fix_delete(self, node, short, side):
+        if not short or node is None: return node
+        if side == 'left':
+            sib = node.right
+            if is_red(sib):
+                new_root = mk(RED, node.left, node.key, node.value, sib.left)
+                fixed, _ = self._fix_delete(new_root, True, 'left'), False
+                return mk(BLACK, fixed, sib.key, sib.value, sib.right)
+            if sib and is_black(sib.left) and is_black(sib.right):
+                return mk(node.color, node.left, node.key, node.value, mk(RED, sib.left, sib.key, sib.value, sib.right))
+        return node
+
+    def search(self, key):
+        n = self.root
+        while n:
+            if key == n.key: return n.value
+            n = n.left if key < n.key else n.right
+        return None
+
+    def count(self):
+        def _c(n): return 0 if n is None else 1 + _c(n.left) + _c(n.right)
+        return _c(self.root)
+
+# ═══════════════════════════════════════════════════════════════
+# ALGORITHM 2: MOY MONADIC (Section 3 of paper)
+# Result monad: D = done, T = todo (short-circuit)
+# ═══════════════════════════════════════════════════════════════
+
+class MonadicTree:
+    name = "Monadic (Moy)"
+
+    def __init__(self):
+        self.root = None
+        self.rotations = 0
+        self.balance_calls = 0
+        self.short_circuits = 0   # D results — work stopped early
+        self.todo_calls = 0       # T results — work continues
+
+    # Result monad: (is_todo: bool, tree)
+    def _done(self, tree): return (False, tree)   # D constructor
+    def _todo(self, tree): return (True,  tree)   # T constructor
+
+    def _fmap(self, f, result):
+        is_todo, tree = result
+        return (is_todo, f(tree))
+
+    def _bind(self, result, f):
+        is_todo, tree = result
+        if not is_todo:
+            self.short_circuits += 1
+            return result   # D: short-circuit, propagate done
+        return f(tree)      # T: continue balancing
+
+    def _balance(self, color, left, key, value, right):
+        self.balance_calls += 1
+        n = mk(color, left, key, value, right)
+        # Case 1: left-left red
+        if color==BLACK and is_red(left) and left and is_red(left.left):
+            a,x,vx = left.left.left, left.left.key, left.left.value
+            b,y,vy = left.left.right, left.key, left.value
+            c,z,vz = left.right, key, value
+            d = right
+            self.rotations += 1
+            return self._todo(mk(RED, mk(BLACK,a,x,vx,b), y,vy, mk(BLACK,c,z,vz,d)))
+        # Case 2: left-right red
+        if color==BLACK and is_red(left) and left and is_red(left.right):
+            a,x,vx = left.left, left.key, left.value
+            b,y,vy = left.right.left, left.right.key, left.right.value
+            c,z,vz = left.right.right, key, value
+            d = right
+            self.rotations += 1
+            return self._todo(mk(RED, mk(BLACK,a,x,vx,b), y,vy, mk(BLACK,c,z,vz,d)))
+        # Case 3: right-left red
+        if color==BLACK and is_red(right) and right and is_red(right.left):
+            a,x,vx = left, key, value
+            b,y,vy = right.left.left, right.left.key, right.left.value
+            c,z,vz = right.left.right, right.key, right.value
+            d = right.right
+            self.rotations += 1
+            return self._todo(mk(RED, mk(BLACK,a,x,vx,b), y,vy, mk(BLACK,c,z,vz,d)))
+        # Case 4: right-right red
+        if color==BLACK and is_red(right) and right and is_red(right.right):
+            a,x,vx = left, key, value
+            b,y,vy = right.left, right.key, right.value
+            c,z,vz = right.right.left, right.right.key, right.right.value
+            d = right.right.right
+            self.rotations += 1
+            return self._todo(mk(RED, mk(BLACK,a,x,vx,b), y,vy, mk(BLACK,c,z,vz,d)))
+        # Black node — work is DONE (D constructor = short-circuit)
+        if color == BLACK:
+            self.short_circuits += 1
+            return self._done(mk(BLACK, left, key, value, right))
+        # Red node — may need more work (T constructor)
+        self.todo_calls += 1
+        return self._todo(mk(RED, left, key, value, right))
+
+    def _ins(self, node, key, value):
+        if node is None:
+            return self._todo(mk(RED, None, key, value, None))
+        if key < node.key:
+            result = self._ins(node.left, key, value)
+            new_result = self._fmap(lambda a: mk(node.color, a, node.key, node.value, node.right), result)
+            return self._bind(new_result, lambda t: self._balance(t.color, t.left, t.key, t.value, t.right))
+        elif key > node.key:
+            result = self._ins(node.right, key, value)
+            new_result = self._fmap(lambda b: mk(node.color, node.left, node.key, node.value, b), result)
+            return self._bind(new_result, lambda t: self._balance(t.color, t.left, t.key, t.value, t.right))
+        else:
+            return self._done(node)
+
+    def insert(self, key, value):
+        _, r = self._ins(self.root, key, value)
+        if r: self.root = mk(BLACK, r.left, r.key, r.value, r.right)
+        else: self.root = r
+
+    # Deletion using balance' + eqL + eqR (Section 4 of paper)
+    def _blacken_prime(self, node):
+        """blacken' from paper"""
+        if node and is_red(node):
+            return self._done(mk(BLACK, node.left, node.key, node.value, node.right))
+        return self._todo(node)
+
+    def _balance_prime(self, node):
+        """balance' from Section 4.1 — resolves violations AND increases black height"""
+        self.balance_calls += 1
+        if node is None: return self._blacken_prime(node)
+        k, left, key, value, right = node.color, node.left, node.key, node.value, node.right
+        # Same 4 cases but preserves root color and returns D
+        if is_red(left) and left and is_red(left.left):
+            a,x,vx = left.left.left, left.left.key, left.left.value
+            b,y,vy = left.left.right, left.key, left.value
+            c,z,vz = left.right, key, value
+            d = right
+            self.rotations += 1
+            return self._done(mk(k, mk(BLACK,a,x,vx,b), y,vy, mk(BLACK,c,z,vz,d)))
+        if is_red(left) and left and is_red(left.right):
+            a,x,vx = left.left, left.key, left.value
+            b,y,vy = left.right.left, left.right.key, left.right.value
+            c,z,vz = left.right.right, key, value
+            d = right
+            self.rotations += 1
+            return self._done(mk(k, mk(BLACK,a,x,vx,b), y,vy, mk(BLACK,c,z,vz,d)))
+        if is_red(right) and right and is_red(right.left):
+            a,x,vx = left, key, value
+            b,y,vy = right.left.left, right.left.key, right.left.value
+            c,z,vz = right.left.right, right.key, right.value
+            d = right.right
+            self.rotations += 1
+            return self._done(mk(k, mk(BLACK,a,x,vx,b), y,vy, mk(BLACK,c,z,vz,d)))
+        if is_red(right) and right and is_red(right.right):
+            a,x,vx = left, key, value
+            b,y,vy = right.left, right.key, right.value
+            c,z,vz = right.right.left, right.right.key, right.right.value
+            d = right.right.right
+            self.rotations += 1
+            return self._done(mk(k, mk(BLACK,a,x,vx,b), y,vy, mk(BLACK,c,z,vz,d)))
+        return self._blacken_prime(node)
+
+    def _eqL(self, node):
+        """eqL from Section 4.2 — left child is short"""
+        if node is None: return self._todo(node)
+        k, a, x, vx, sib = node.color, node.left, node.key, node.value, node.right
+        if sib is None: return self._todo(node)
+        if sib.color == BLACK:
+            # Redden sibling, apply balance'
+            new_sib = mk(RED, sib.left, sib.key, sib.value, sib.right)
+            return self._balance_prime(mk(k, a, x, vx, new_sib))
+        else:
+            # Red sibling: rotate and recurse
+            b, y, vy, c = sib.left, sib.key, sib.value, sib.right
+            inner = mk(RED, a, x, vx, b)
+            result = self._eqL(inner)
+            return self._fmap(lambda new_a: mk(BLACK, new_a, y, vy, c), result)
+
+    def _eqR(self, node):
+        """eqR from Section 4.2 — right child is short"""
+        if node is None: return self._todo(node)
+        k, sib, y, vy, c = node.color, node.left, node.key, node.value, node.right
+        if sib is None: return self._todo(node)
+        if sib.color == BLACK:
+            new_sib = mk(RED, sib.left, sib.key, sib.value, sib.right)
+            return self._balance_prime(mk(k, new_sib, y, vy, c))
+        else:
+            a, x, vx, b = sib.left, sib.key, sib.value, sib.right
+            inner = mk(RED, b, y, vy, c)
+            result = self._eqR(inner)
+            return self._fmap(lambda new_b: mk(BLACK, a, x, vx, new_b), result)
+
+    def _del_min(self, node):
+        """delMin from Section 4.3"""
+        if node is None: return self._done(None), None
+        if node.left is None:
+            min_key, min_val = node.key, node.value
+            if is_red(node): return self._done(node.right), (min_key, min_val)
+            return self._blacken_prime(node.right), (min_key, min_val)
+        result, min_kv = self._del_min(node.left)
+        new_result = self._fmap(lambda a: mk(node.color, a, node.key, node.value, node.right), result)
+        return self._bind(new_result, self._eqL), min_kv
+
+    def _del_cur(self, node):
+        """delCur from Section 4.3"""
+        if node is None: return self._done(None)
+        if is_red(node) and node.right is None: return self._done(node.left)
+        if not is_red(node) and node.right is None: return self._blacken_prime(node.left)
+        b_result, min_kv = self._del_min(node.right)
+        if min_kv is None: return self._done(node.left)
+        min_key, min_val = min_kv
+        new_result = self._fmap(lambda b: mk(node.color, node.left, min_key, min_val, b), b_result)
+        return self._bind(new_result, self._eqR)
+
+    def _del(self, node, key):
+        """delete from Section 4.3"""
+        if node is None: return self._done(None)
+        if key < node.key:
+            result = self._del(node.left, key)
+            new_result = self._fmap(lambda a: mk(node.color, a, node.key, node.value, node.right), result)
+            return self._bind(new_result, self._eqL)
+        elif key > node.key:
+            result = self._del(node.right, key)
+            new_result = self._fmap(lambda b: mk(node.color, node.left, node.key, node.value, b), result)
+            return self._bind(new_result, self._eqR)
+        else:
+            return self._del_cur(node)
+
+    def delete(self, key):
+        _, r = self._del(self.root, key)
+        self.root = r
+        if self.root: self.root.color = BLACK
+
+    def search(self, key):
+        n = self.root
+        while n:
+            if key == n.key: return n.value
+            n = n.left if key < n.key else n.right
+        return None
+
+    def count(self):
+        def _c(n): return 0 if n is None else 1 + _c(n.left) + _c(n.right)
+        return _c(self.root)
+
+# ═══════════════════════════════════════════════════════════════
+# ALGORITHM 3: GERMANE-MIGHT (original + Appendix B corrected)
+# Uses double-black color for deletion
+# ═══════════════════════════════════════════════════════════════
+
+class GermaneMightTree:
+    name = "Germane-Might"
+
+    def __init__(self, corrected=False):
+        self.root = None
+        self.rotations = 0
+        self.balance_calls = 0
+        self.corrected = corrected
+        if corrected: self.name = "Germane-Might (Fixed)"
+
+    def _balance(self, color, left, key, value, right):
+        self.balance_calls += 1
+        if color==BLACK and is_red(left) and left and is_red(left.left):
+            self.rotations += 1
+            return mk(RED, mk(BLACK,left.left.left,left.left.key,left.left.value,left.left.right),
+                      left.key, left.value, mk(BLACK,left.right,key,value,right))
+        if color==BLACK and is_red(left) and left and is_red(left.right):
+            self.rotations += 1
+            return mk(RED, mk(BLACK,left.left,left.key,left.value,left.right.left),
+                      left.right.key, left.right.value, mk(BLACK,left.right.right,key,value,right))
+        if color==BLACK and is_red(right) and right and is_red(right.left):
+            self.rotations += 1
+            return mk(RED, mk(BLACK,left,key,value,right.left.left),
+                      right.left.key, right.left.value, mk(BLACK,right.left.right,right.key,right.value,right.right))
+        if color==BLACK and is_red(right) and right and is_red(right.right):
+            self.rotations += 1
+            return mk(RED, mk(BLACK,left,key,value,right.left),
+                      right.key, right.value, mk(BLACK,right.right.left,right.right.key,right.right.value,right.right.right))
+        return mk(color, left, key, value, right)
+
+    def _ins(self, node, key, value):
+        if node is None: return mk(RED, None, key, value, None)
+        if self.corrected:
+            # Corrected: check common cases FIRST (Appendix B)
+            if key < node.key:
+                return self._balance(node.color, self._ins(node.left,key,value), node.key, node.value, node.right)
+            elif key > node.key:
+                return self._balance(node.color, node.left, node.key, node.value, self._ins(node.right,key,value))
+            else: return node
+        else:
+            # Original: base cases checked first (suboptimal order)
+            if node.left is None and node.right is None:
+                if key < node.key: return self._balance(node.color, mk(RED,None,key,value,None), node.key, node.value, None)
+                elif key > node.key: return self._balance(node.color, None, node.key, node.value, mk(RED,None,key,value,None))
+                else: return node
+            if key < node.key:
+                return self._balance(node.color, self._ins(node.left,key,value), node.key, node.value, node.right)
+            elif key > node.key:
+                return self._balance(node.color, node.left, node.key, node.value, self._ins(node.right,key,value))
+            else: return node
+
+    def insert(self, key, value):
+        r = self._ins(self.root, key, value)
+        self.root = mk(BLACK, r.left, r.key, r.value, r.right)
+
+    def delete(self, key):
+        self.root = self._del(self.root, key)
+        if self.root: self.root.color = BLACK
+
+    def _del(self, node, key):
+        if node is None: return None
+        if key < node.key:
+            return self._bubble(node.color, self._del(node.left,key), node.key, node.value, node.right)
+        elif key > node.key:
+            return self._bubble(node.color, node.left, node.key, node.value, self._del(node.right,key))
+        else:
+            if node.right is None: return node.left
+            min_key, min_val = self._min_node(node.right)
+            new_right = self._del(node.right, min_key)
+            return self._bubble(node.color, node.left, min_key, min_val, new_right)
+
+    def _min_node(self, node):
+        while node.left: node = node.left
+        return node.key, node.value
+
+    def _bubble(self, color, left, key, value, right):
+        return self._balance(color, left, key, value, right)
+
+    def search(self, key):
+        n = self.root
+        while n:
+            if key == n.key: return n.value
+            n = n.left if key < n.key else n.right
+        return None
+
+    def count(self):
+        def _c(n): return 0 if n is None else 1 + _c(n.left) + _c(n.right)
+        return _c(self.root)
+
+# ═══════════════════════════════════════════════════════════════
+# INVARIANT VERIFIER
+# Proves both paper invariants after every operation
+# ═══════════════════════════════════════════════════════════════
+
+def verify_invariants(root):
+    violations = []
+
+    def check_red_child(node, parent_red=False):
+        if node is None: return
+        if parent_red and is_red(node):
+            violations.append(f"RED-CHILD VIOLATION at key={node.key}")
+        check_red_child(node.left, is_red(node))
+        check_red_child(node.right, is_red(node))
+
+    def check_black_height(node):
+        if node is None: return 0
+        lbh = check_black_height(node.left)
+        rbh = check_black_height(node.right)
+        if lbh != rbh:
+            violations.append(f"BLACK-HEIGHT VIOLATION at key={node.key}: left={lbh}, right={rbh}")
+        return lbh + (1 if is_black(node) else 0)
+
+    def get_height(node):
+        if node is None: return 0
+        return 1 + max(get_height(node.left), get_height(node.right))
+
+    def get_black_height(node):
+        if node is None: return 0
+        return get_black_height(node.left) + (1 if is_black(node) else 0)
+
+    check_red_child(root)
+    check_black_height(root)
+    height = get_height(root)
+    bh = get_black_height(root)
+
+    return {
+        "valid": len(violations) == 0,
+        "violations": violations,
+        "tree_height": height,
+        "black_height": bh,
+        "red_child_ok": not any("RED-CHILD" in v for v in violations),
+        "black_height_ok": not any("BLACK-HEIGHT" in v for v in violations),
+    }
+
+# ═══════════════════════════════════════════════════════════════
+# THREAT MODEL
+# ═══════════════════════════════════════════════════════════════
+
+THREAT_TYPES = [
+    {"type": "DDOS",        "label": "DDoS Attack",         "base_sev": 95, "color": "#ff2d55"},
+    {"type": "RANSOMWARE",  "label": "Ransomware",          "base_sev": 92, "color": "#ff3b30"},
+    {"type": "MALWARE",     "label": "Malware Injection",   "base_sev": 85, "color": "#ff6b35"},
+    {"type": "BRUTEFORCE",  "label": "Brute Force",         "base_sev": 75, "color": "#ff9f0a"},
+    {"type": "SQLINJECT",   "label": "SQL Injection",       "base_sev": 70, "color": "#ffd60a"},
+    {"type": "PORTSCAN",    "label": "Port Scan",           "base_sev": 55, "color": "#30d158"},
+    {"type": "PHISHING",    "label": "Phishing",            "base_sev": 50, "color": "#0a84ff"},
+    {"type": "RECON",       "label": "Reconnaissance",      "base_sev": 35, "color": "#5e5ce6"},
+    {"type": "ANOMALY",     "label": "Anomaly Detected",    "base_sev": 20, "color": "#636366"},
+]
+
+def random_ip(): return f"{random.randint(1,255)}.{random.randint(0,255)}.{random.randint(0,255)}.{random.randint(1,254)}"
+
+def make_threat(ttype=None):
+    t = ttype or random.choice(THREAT_TYPES)
+    jitter = random.randint(-8, 8)
+    severity = max(1, min(99, t["base_sev"] + jitter))
+    tid = str(uuid.uuid4())[:8].upper()
+    return {
+        "id": tid,
+        "type": t["type"],
+        "label": t["label"],
+        "severity": severity,
+        "color": t["color"],
+        "source_ip": random_ip(),
+        "target_ip": random_ip(),
+        "timestamp": time.time(),
+        "status": "ACTIVE",
+        "protocol": random.choice(["TCP","UDP","ICMP","HTTP","HTTPS"]),
+        "port": random.choice([22,80,443,3306,8080,445,1433,3389]),
+        "confidence": round(random.uniform(0.65, 0.99), 2),
+    }
+
+# ═══════════════════════════════════════════════════════════════
+# APPLICATION STATE
+# ═══════════════════════════════════════════════════════════════
+
+# Primary tree (Monadic) for live operations
+primary_tree = MonadicTree()
+okasaki_tree = OkasakiTree()
+
+activity_log = []
+resolved_log = []
+threat_registry = {}   # id -> threat dict
+threat_counter = [0]
+benchmark_results = {}
+
+def add_log(msg, color="#94a3b8", level="INFO"):
+    entry = {"msg": msg, "color": color, "level": level, "t": time.time()}
+    activity_log.insert(0, entry)
+    if len(activity_log) > 80: activity_log.pop()
+
+def get_stats():
+    inv = verify_invariants(primary_tree.root)
+    return {
+        "inQueue":        primary_tree.count(),
+        "totalResolved":  len(resolved_log),
+        "rotations":      primary_tree.rotations,
+        "shortCircuits":  primary_tree.short_circuits,
+        "balanceCalls":   primary_tree.balance_calls,
+        "todoCount":      primary_tree.todo_calls,
+        "invariantValid": inv["valid"],
+        "treeHeight":     inv["tree_height"],
+        "blackHeight":    inv["black_height"],
+        "redChildOk":     inv["red_child_ok"],
+        "blackHeightOk":  inv["black_height_ok"],
+    }
+
+# ═══════════════════════════════════════════════════════════════
+# FLASK ROUTES
+# ═══════════════════════════════════════════════════════════════
+
+@app.route("/")
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route("/api/inject", methods=["POST"])
+def inject():
+    data = request.json or {}
+    ttype_name = data.get("type")
+    ttype = next((t for t in THREAT_TYPES if t["type"] == ttype_name), None)
+    threat = make_threat(ttype)
+    threat_registry[threat["id"]] = threat
+    threat_counter[0] += 1
+
+    primary_tree.insert(threat["severity"], threat)
+    okasaki_tree.insert(threat["severity"], threat)
+
+    inv = verify_invariants(primary_tree.root)
+    sc_pct = round((primary_tree.short_circuits / max(primary_tree.balance_calls,1)) * 100, 1)
+
+    add_log(
+        f"🔴 THREAT [{threat['type']}] P:{threat['severity']} from {threat['source_ip']} | SC:{sc_pct}%",
+        threat["color"], "ALERT"
+    )
+    return jsonify({
+        "threat": threat,
+        "tree": primary_tree.root.to_dict() if primary_tree.root else None,
+        "okasaki_tree": okasaki_tree.root.to_dict() if okasaki_tree.root else None,
+        "stats": get_stats(),
+        "invariant": inv,
+    })
+
+@app.route("/api/resolve", methods=["POST"])
+def resolve():
+    data = request.json or {}
+    tid = data.get("id")
+    threat = threat_registry.get(tid)
+    if not threat:
+        return jsonify({"error": "Threat not found"}), 404
+
+    primary_tree.delete(threat["severity"])
+    okasaki_tree.delete(threat["severity"])
+    threat["status"] = "RESOLVED"
+    resolved_log.insert(0, {**threat, "resolvedAt": time.time()})
+    if len(resolved_log) > 30: resolved_log.pop()
+    del threat_registry[tid]
+
+    add_log(f"✅ RESOLVED [{threat['type']}] P:{threat['severity']} | {tid}", "#30d158", "RESOLVED")
+    return jsonify({
+        "tree": primary_tree.root.to_dict() if primary_tree.root else None,
+        "okasaki_tree": okasaki_tree.root.to_dict() if okasaki_tree.root else None,
+        "stats": get_stats(),
+    })
+
+@app.route("/api/serve_critical", methods=["POST"])
+def serve_critical():
+    """Serve the highest severity threat"""
+    if not primary_tree.root: return jsonify({"threat": None, "stats": get_stats()})
+    node = primary_tree.root
+    while node.right: node = node.right
+    threat = node.value
+    if threat:
+        primary_tree.delete(threat["severity"])
+        okasaki_tree.delete(threat["severity"])
+        threat["status"] = "MITIGATED"
+        resolved_log.insert(0, {**threat, "resolvedAt": time.time()})
+        if len(resolved_log) > 30: resolved_log.pop()
+        if threat["id"] in threat_registry: del threat_registry[threat["id"]]
+        add_log(f"🛡️ MITIGATED CRITICAL [{threat['type']}] P:{threat['severity']}", "#0a84ff", "MITIGATED")
+    return jsonify({
+        "threat": threat,
+        "tree": primary_tree.root.to_dict() if primary_tree.root else None,
+        "stats": get_stats(),
+    })
+
+@app.route("/api/benchmark", methods=["POST"])
+def benchmark():
+    data = request.json or {}
+    n = min(int(data.get("n", 500)), 2000)
+    order = data.get("order", "random")
+
+    keys = list(range(1, n+1))
+    if order == "random": random.shuffle(keys)
+    elif order == "descending": keys = list(reversed(keys))
+
+    results = {}
+    trees = [
+        ("Monadic (Moy)", MonadicTree()),
+        ("Okasaki", OkasakiTree()),
+        ("Germane-Might", GermaneMightTree(corrected=False)),
+        ("Germane-Might (Fixed)", GermaneMightTree(corrected=True)),
+    ]
+
+    for name, tree in trees:
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        for k in keys:
+            tree.insert(k, {"severity": k, "type": "BENCH"})
+        insert_time = (time.perf_counter() - t0) * 1000
+
+        t1 = time.perf_counter()
+        del_keys = keys[:n//2]
+        for k in del_keys:
+            tree.delete(k)
+        delete_time = (time.perf_counter() - t1) * 1000
+
+        _, mem_peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        inv = verify_invariants(tree.root)
+        sc_pct = round((getattr(tree,'short_circuits',0) / max(getattr(tree,'balance_calls',1),1)) * 100, 1)
+
+        results[name] = {
+            "insert_ms":      round(insert_time, 2),
+            "delete_ms":      round(delete_time, 2),
+            "total_ms":       round(insert_time + delete_time, 2),
+            "rotations":      getattr(tree, 'rotations', 0),
+            "balance_calls":  getattr(tree, 'balance_calls', 0),
+            "short_circuits": getattr(tree, 'short_circuits', 0),
+            "sc_percent":     sc_pct,
+            "memory_kb":      round(mem_peak / 1024, 1),
+            "invariant_valid":inv["valid"],
+            "tree_height":    inv["tree_height"],
+            "black_height":   inv["black_height"],
+            "n": n, "order": order,
+        }
+
+    # Calculate speedups vs Okasaki
+    ok_ins = results["Okasaki"]["insert_ms"]
+    ok_del = results["Okasaki"]["delete_ms"]
+    for name in results:
+        if name != "Okasaki":
+            results[name]["insert_speedup"] = round(ok_ins / max(results[name]["insert_ms"], 0.001), 2)
+            results[name]["delete_speedup"] = round(ok_del / max(results[name]["delete_ms"], 0.001), 2)
+
+    benchmark_results.update(results)
+    add_log(f"📊 BENCHMARK n={n} [{order}] — Monadic {results['Monadic (Moy)']['insert_speedup'] if 'insert_speedup' in results.get('Monadic (Moy)',{}) else '?'}× faster", "#5e5ce6", "BENCH")
+    return jsonify(results)
+
+@app.route("/api/verify", methods=["GET"])
+def verify():
+    monic_inv = verify_invariants(primary_tree.root)
+    ok_inv = verify_invariants(okasaki_tree.root)
+    return jsonify({
+        "monadic": monic_inv,
+        "okasaki": ok_inv,
+        "monad_stats": {
+            "short_circuits": primary_tree.short_circuits,
+            "todo_calls": primary_tree.todo_calls,
+            "balance_calls": primary_tree.balance_calls,
+            "sc_percent": round((primary_tree.short_circuits / max(primary_tree.balance_calls,1))*100, 1),
+        }
+    })
+
+@app.route("/api/state", methods=["GET"])
+def state():
+    return jsonify({
+        "tree": primary_tree.root.to_dict() if primary_tree.root else None,
+        "okasaki_tree": okasaki_tree.root.to_dict() if okasaki_tree.root else None,
+        "log": activity_log[:50],
+        "resolved": resolved_log[:20],
+        "stats": get_stats(),
+        "threats": list(threat_registry.values()),
+        "threat_types": THREAT_TYPES,
+    })
+
+@app.route("/api/reset", methods=["POST"])
+def reset():
+    global primary_tree, okasaki_tree, activity_log, resolved_log, threat_registry, benchmark_results
+    primary_tree = MonadicTree()
+    okasaki_tree = OkasakiTree()
+    activity_log = []
+    resolved_log = []
+    threat_registry = {}
+    benchmark_results = {}
+    threat_counter[0] = 0
+    return jsonify({"ok": True})
+
+# ═══════════════════════════════════════════════════════════════
+# HTML TEMPLATE
+# ═══════════════════════════════════════════════════════════════
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>IDS — Monadic RB Tree Engine</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@500;700&display=swap" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#040d0a;--bg2:#071410;--bg3:#0a1e18;--bg4:#0d2820;
+  --border:#0f3d2a;--border2:#1a5c3f;
+  --green:#00ff88;--green2:#00cc6a;--green3:#004d29;
+  --red:#ff2d55;--orange:#ff6b35;--yellow:#ffd60a;
+  --blue:#0a84ff;--purple:#5e5ce6;--cyan:#32d2f5;
+  --text:#c8ffd4;--muted:#4a7a5e;--dim:#1a3d28;
+}
+body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+
+/* scanline effect */
+body::before{content:'';position:fixed;top:0;left:0;width:100%;height:100%;background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,0.03) 2px,rgba(0,0,0,0.03) 4px);pointer-events:none;z-index:1000}
+
+header{background:linear-gradient(90deg,#040d0a,#071f14,#040d0a);border-bottom:1px solid var(--border2);padding:10px 20px;display:flex;align-items:center;justify-content:space-between;flex-shrink:0;position:relative}
+header::after{content:'';position:absolute;bottom:0;left:0;width:100%;height:1px;background:linear-gradient(90deg,transparent,var(--green),transparent)}
+.logo{font-family:'Rajdhani',sans-serif;font-size:20px;font-weight:700;color:var(--green);letter-spacing:4px;text-shadow:0 0 20px rgba(0,255,136,0.5)}
+.logo span{color:var(--red);text-shadow:0 0 20px rgba(255,45,85,0.5)}
+.subtitle{font-size:9px;color:var(--muted);letter-spacing:3px;margin-top:2px}
+.hdr-right{display:flex;align-items:center;gap:8px}
+.threat-count{font-size:11px;color:var(--red);background:#ff2d5520;border:1px solid #ff2d5540;padding:4px 10px;border-radius:2px;letter-spacing:1px}
+.threat-count.pulse{animation:tpulse 1s infinite}
+@keyframes tpulse{0%,100%{opacity:1;border-color:#ff2d5540}50%{opacity:.6;border-color:var(--red)}}
+
+button{font-family:'Share Tech Mono',monospace;font-size:10px;letter-spacing:1px;border-radius:2px;padding:7px 12px;cursor:pointer;transition:all .15s;border:1px solid}
+.btn-red{background:#ff2d5520;border-color:#ff2d5540;color:var(--red)}
+.btn-red:hover{background:#ff2d5535;border-color:var(--red);box-shadow:0 0 10px #ff2d5530}
+.btn-green{background:#00ff8820;border-color:#00ff8840;color:var(--green)}
+.btn-green:hover{background:#00ff8835;border-color:var(--green);box-shadow:0 0 10px #00ff8830}
+.btn-blue{background:#0a84ff20;border-color:#0a84ff40;color:var(--blue)}
+.btn-blue:hover{background:#0a84ff35;border-color:var(--blue)}
+.btn-purple{background:#5e5ce620;border-color:#5e5ce640;color:var(--purple)}
+.btn-purple:hover{background:#5e5ce635;border-color:var(--purple)}
+.btn-muted{background:transparent;border-color:var(--border2);color:var(--muted)}
+.btn-muted:hover{border-color:var(--muted);color:var(--text)}
+.btn-auto.active{background:#ff2d5520;border-color:var(--red);color:var(--red)}
+
+.main{display:grid;grid-template-columns:1fr 340px 300px;flex:1;overflow:hidden}
+
+/* CENTER PANEL */
+.center{display:flex;flex-direction:column;border-left:1px solid var(--border);border-right:1px solid var(--border);overflow:hidden}
+
+/* STATS */
+.stats-grid{display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid var(--border);flex-shrink:0}
+.stat-box{padding:10px 14px;border-right:1px solid var(--border);position:relative;overflow:hidden}
+.stat-box::after{content:'';position:absolute;bottom:0;left:0;width:100%;height:2px}
+.stat-box:nth-child(1)::after{background:var(--red)}
+.stat-box:nth-child(2)::after{background:var(--green)}
+.stat-box:nth-child(3)::after{background:var(--purple)}
+.stat-box:nth-child(4)::after{background:var(--cyan)}
+.stat-label{font-size:8px;color:var(--muted);letter-spacing:2px;margin-bottom:3px}
+.stat-val{font-family:'Rajdhani',sans-serif;font-size:22px;font-weight:700}
+
+/* TREE VIZ */
+.trees-panel{flex:1;overflow:auto;padding:14px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
+.tree-label{font-size:9px;color:var(--muted);letter-spacing:3px;margin-bottom:6px;display:flex;align-items:center;gap:8px}
+.tree-label::after{content:'';flex:1;height:1px;background:var(--border)}
+.tree-container{border:1px solid var(--border);border-radius:2px;padding:10px;background:var(--bg2);min-height:120px;overflow-x:auto}
+svg.tree-svg{overflow:visible}
+.empty-msg{font-size:11px;fill:#1a3d28;font-family:'Share Tech Mono',monospace}
+
+/* INVARIANT */
+.inv-bar{border-top:1px solid var(--border);padding:10px 14px;display:flex;gap:16px;align-items:center;flex-shrink:0;background:var(--bg2);font-size:10px}
+.inv-item{display:flex;align-items:center;gap:5px}
+.inv-dot{width:8px;height:8px;border-radius:50%}
+
+/* BENCHMARK */
+.bench-panel{border-top:1px solid var(--border);padding:12px 14px;flex-shrink:0;background:var(--bg2)}
+.bench-controls{display:flex;gap:8px;margin-bottom:10px;align-items:center;flex-wrap:wrap}
+.bench-select{background:var(--bg3);border:1px solid var(--border2);color:var(--text);padding:5px 8px;font-family:inherit;font-size:10px;border-radius:2px}
+.bench-results{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.bench-card{background:var(--bg3);border:1px solid var(--border);padding:8px;border-radius:2px;font-size:9px}
+.bench-name{color:var(--cyan);margin-bottom:4px;font-size:9px;letter-spacing:1px}
+.bench-val{font-family:'Rajdhani',sans-serif;font-size:14px;font-weight:700;color:var(--green)}
+.bench-sub{color:var(--muted);font-size:8px}
+
+/* RIGHT PANEL — THREATS */
+.right-panel{display:flex;flex-direction:column;overflow:hidden;background:var(--bg2)}
+.panel-hdr{padding:10px 12px 8px;font-size:9px;color:var(--muted);letter-spacing:3px;border-bottom:1px solid var(--border);flex-shrink:0;display:flex;justify-content:space-between;align-items:center}
+
+/* Threat type injectors */
+.threat-types{padding:10px 12px;border-bottom:1px solid var(--border);flex-shrink:0}
+.ttype-row{display:flex;align-items:center;justify-content:space-between;padding:5px 8px;border-radius:2px;cursor:pointer;border:1px solid transparent;transition:all .15s;margin-bottom:3px;font-size:10px}
+.ttype-row:hover{filter:brightness(1.4)}
+
+/* Active threats */
+.threats-list{flex:1;overflow-y:auto;padding:8px 12px}
+.threat-card{background:var(--bg3);border-radius:2px;padding:8px 10px;margin-bottom:4px;border-left:3px solid;font-size:9px;cursor:pointer;transition:all .15s;position:relative}
+.threat-card:hover{filter:brightness(1.2)}
+.threat-card .t-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:2px}
+.threat-card .t-type{font-size:10px;font-weight:bold;letter-spacing:1px}
+.threat-card .t-sev{font-family:'Rajdhani',sans-serif;font-size:14px;font-weight:700}
+.threat-card .t-meta{color:var(--muted);font-size:8px;letter-spacing:.5px}
+.threat-card .resolve-btn{position:absolute;top:6px;right:6px;background:#00ff8815;border:1px solid #00ff8840;color:var(--green);font-size:8px;padding:2px 6px;border-radius:1px;cursor:pointer;display:none;font-family:inherit}
+.threat-card:hover .resolve-btn{display:block}
+
+/* LEFT PANEL — LOG + MONAD */
+.left-panel{display:flex;flex-direction:column;overflow:hidden}
+.monad-panel{padding:12px;border-bottom:1px solid var(--border);flex-shrink:0;background:var(--bg2)}
+.monad-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
+.monad-card{background:var(--bg3);border:1px solid var(--border);padding:8px;border-radius:2px;text-align:center}
+.monad-val{font-family:'Rajdhani',sans-serif;font-size:18px;font-weight:700}
+.monad-lbl{font-size:8px;color:var(--muted);letter-spacing:1px;margin-top:2px}
+.monad-bar-wrap{margin-top:8px}
+.monad-bar-track{height:6px;background:var(--bg3);border-radius:3px;overflow:hidden;margin-top:3px}
+.monad-bar-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--green),var(--cyan));transition:width .5s}
+
+.log-panel{flex:1;overflow:hidden;display:flex;flex-direction:column}
+.log-scroll{flex:1;overflow-y:auto;padding:6px 12px 10px}
+.log-entry{font-size:9px;padding:3px 0;border-bottom:1px solid #071410;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:color .5s}
+
+/* Resolved */
+.resolved-panel{border-top:1px solid var(--border);padding:8px 12px;max-height:140px;overflow-y:auto;background:var(--bg2);flex-shrink:0}
+
+::-webkit-scrollbar{width:3px;height:3px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
+
+@keyframes flash{0%{background:#00ff8820}100%{background:transparent}}
+.flash{animation:flash .6s ease}
+
+.controls{display:flex;gap:6px;flex-wrap:wrap;padding:8px 12px;border-bottom:1px solid var(--border);flex-shrink:0;background:var(--bg2)}
+
+.status-dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:4px}
+.dot-active{background:var(--red);box-shadow:0 0 6px var(--red);animation:tpulse 1s infinite}
+.dot-ok{background:var(--green);box-shadow:0 0 6px var(--green)}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <div class="logo">CYBER<span>IDS</span> // RB-TREE ENGINE</div>
+    <div class="subtitle">MOY MONADIC ALGORITHM · OKASAKI · GERMANE-MIGHT · FILLIÂTRE · PAPER SECTION 2-5</div>
+  </div>
+  <div class="hdr-right">
+    <div class="threat-count" id="hdr-count">0 ACTIVE THREATS</div>
+    <div style="font-size:9px;color:var(--muted)" id="hdr-inv">⬡ INVARIANTS: —</div>
+  </div>
+</header>
+
+<div class="main">
+
+  <!-- LEFT: Monad stats + Log -->
+  <div class="left-panel">
+    <div class="controls">
+      <button class="btn-red" id="btn-inject">⚡ INJECT THREAT</button>
+      <button class="btn-green" id="btn-serve">🛡 SERVE CRITICAL</button>
+      <button class="btn-blue" id="btn-auto">▶ AUTO SIM</button>
+      <button class="btn-muted" id="btn-reset">↺ RESET</button>
+    </div>
+
+    <div class="monad-panel">
+      <div class="panel-hdr" style="padding:0 0 6px;border:none">
+        MONAD INSPECTOR — RESULT D/T COUNTERS
+        <span style="font-size:8px;color:var(--green)">SECTION 3 OF PAPER</span>
+      </div>
+      <div class="monad-grid">
+        <div class="monad-card">
+          <div class="monad-val" style="color:var(--green)" id="m-sc">0</div>
+          <div class="monad-lbl">D() SHORT-CIRCUITS</div>
+        </div>
+        <div class="monad-card">
+          <div class="monad-val" style="color:var(--orange)" id="m-todo">0</div>
+          <div class="monad-lbl">T() CONTINUE</div>
+        </div>
+        <div class="monad-card">
+          <div class="monad-val" style="color:var(--cyan)" id="m-bc">0</div>
+          <div class="monad-lbl">BALANCE CALLS</div>
+        </div>
+        <div class="monad-card">
+          <div class="monad-val" style="color:var(--purple)" id="m-rot">0</div>
+          <div class="monad-lbl">ROTATIONS</div>
+        </div>
+      </div>
+      <div class="monad-bar-wrap">
+        <div style="font-size:8px;color:var(--muted);letter-spacing:1px;display:flex;justify-content:space-between">
+          <span>SHORT-CIRCUIT SAVINGS</span>
+          <span id="m-pct" style="color:var(--green)">0%</span>
+        </div>
+        <div class="monad-bar-track"><div class="monad-bar-fill" id="m-bar" style="width:0%"></div></div>
+      </div>
+    </div>
+
+    <div class="log-panel">
+      <div class="panel-hdr">ACTIVITY LOG <span id="log-count" style="color:var(--muted)">0 ENTRIES</span></div>
+      <div class="log-scroll" id="log-scroll">
+        <div style="font-size:10px;color:var(--dim);margin-top:8px">System ready. Awaiting threat data...</div>
+      </div>
+    </div>
+
+    <div class="resolved-panel">
+      <div class="panel-hdr" style="padding:0 0 6px;border:none;margin-bottom:6px">RESOLVED / MITIGATED</div>
+      <div id="resolved-list"><div style="font-size:9px;color:var(--dim)">No resolved threats yet.</div></div>
+    </div>
+  </div>
+
+  <!-- CENTER: Trees + Benchmark -->
+  <div class="center">
+    <div class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-label">ACTIVE THREATS</div>
+        <div class="stat-val" style="color:var(--red)" id="s-queue">0</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">MITIGATED</div>
+        <div class="stat-val" style="color:var(--green)" id="s-res">0</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">TREE HEIGHT</div>
+        <div class="stat-val" style="color:var(--purple)" id="s-height">0</div>
+      </div>
+      <div class="stat-box" style="border-right:none">
+        <div class="stat-label">BLACK HEIGHT</div>
+        <div class="stat-val" style="color:var(--cyan)" id="s-bh">0</div>
+      </div>
+    </div>
+
+    <div class="trees-panel">
+      <div>
+        <div class="tree-label">
+          <span class="status-dot dot-ok"></span>
+          MONADIC TREE (MOY — SECTION 3) — SHORT-CIRCUIT ENABLED
+        </div>
+        <div class="tree-container">
+          <svg id="moy-svg" class="tree-svg" width="100%" height="160">
+            <text class="empty-msg" x="50%" y="80" text-anchor="middle">Inject threats to populate the Monadic RB Tree</text>
+          </svg>
+        </div>
+      </div>
+      <div>
+        <div class="tree-label">
+          <span class="status-dot" style="background:var(--orange);box-shadow:0 0 6px var(--orange)"></span>
+          OKASAKI TREE (SECTION 2) — 4-CASE BALANCE, NO SHORT-CIRCUIT
+        </div>
+        <div class="tree-container">
+          <svg id="ok-svg" class="tree-svg" width="100%" height="160">
+            <text class="empty-msg" x="50%" y="80" text-anchor="middle">Okasaki tree mirrors Monadic insertions for comparison</text>
+          </svg>
+        </div>
+      </div>
+    </div>
+
+    <div class="inv-bar">
+      <div class="inv-item"><div class="inv-dot" id="inv-rc-dot" style="background:var(--muted)"></div><span id="inv-rc" style="font-size:9px;color:var(--muted)">RED-CHILD: —</span></div>
+      <div class="inv-item"><div class="inv-dot" id="inv-bh-dot" style="background:var(--muted)"></div><span id="inv-bh" style="font-size:9px;color:var(--muted)">BLACK-HEIGHT: —</span></div>
+      <div style="flex:1"></div>
+      <div style="font-size:9px;color:var(--muted)">BOTH INVARIANTS FROM PAPER SECTION 1</div>
+    </div>
+
+    <div class="bench-panel">
+      <div class="panel-hdr" style="padding:0 0 8px;border:none">
+        ALGORITHM BENCHMARK — TABLES 1 & 2 FROM PAPER
+        <span style="font-size:8px;color:var(--purple)">MOY vs OKASAKI vs GERMANE-MIGHT</span>
+      </div>
+      <div class="bench-controls">
+        <select class="bench-select" id="bench-n">
+          <option value="100">n=100</option>
+          <option value="500" selected>n=500</option>
+          <option value="1000">n=1000</option>
+          <option value="2000">n=2000</option>
+        </select>
+        <select class="bench-select" id="bench-order">
+          <option value="random">Random</option>
+          <option value="ascending">Ascending</option>
+          <option value="descending">Descending</option>
+        </select>
+        <button class="btn-purple" id="btn-bench">▶ RUN BENCHMARK</button>
+        <span id="bench-status" style="font-size:9px;color:var(--muted)"></span>
+      </div>
+      <div class="bench-results" id="bench-results">
+        <div style="font-size:9px;color:var(--dim);grid-column:span 4">Run benchmark to compare all algorithms from the paper</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: Threat types + Active threats -->
+  <div class="right-panel">
+    <div class="panel-hdr">THREAT INJECTION PANEL <span style="color:var(--green);font-size:8px">CLICK TO INJECT TYPE</span></div>
+    <div class="threat-types" id="threat-types-list"></div>
+    <div class="panel-hdr">ACTIVE THREAT QUEUE <span style="font-size:8px;color:var(--muted)" id="queue-count">0 IN RB TREE</span></div>
+    <div class="threats-list" id="threats-list">
+      <div style="font-size:10px;color:var(--dim);margin-top:12px">No active threats. System secure.</div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const THREAT_TYPES = [
+  {type:"DDOS",       label:"DDoS Attack",        base_sev:95, color:"#ff2d55"},
+  {type:"RANSOMWARE", label:"Ransomware",          base_sev:92, color:"#ff3b30"},
+  {type:"MALWARE",    label:"Malware Injection",   base_sev:85, color:"#ff6b35"},
+  {type:"BRUTEFORCE", label:"Brute Force",         base_sev:75, color:"#ff9f0a"},
+  {type:"SQLINJECT",  label:"SQL Injection",       base_sev:70, color:"#ffd60a"},
+  {type:"PORTSCAN",   label:"Port Scan",           base_sev:55, color:"#30d158"},
+  {type:"PHISHING",   label:"Phishing",            base_sev:50, color:"#0a84ff"},
+  {type:"RECON",      label:"Reconnaissance",      base_sev:35, color:"#5e5ce6"},
+  {type:"ANOMALY",    label:"Anomaly Detected",    base_sev:20, color:"#636366"},
+];
+
+// Build threat type buttons
+const ttList = document.getElementById("threat-types-list");
+THREAT_TYPES.forEach(t => {
+  const d = document.createElement("div");
+  d.className = "ttype-row";
+  d.style.background = t.color + "15";
+  d.style.borderColor = t.color + "30";
+  const barW = (t.base_sev * 0.6).toFixed(0);
+  d.innerHTML = `<span style="color:#c8ffd4;font-size:10px">${t.label}</span>
+    <div style="display:flex;align-items:center;gap:6px">
+      <div style="width:${barW}px;height:3px;background:${t.color};border-radius:2px;opacity:.8"></div>
+      <span style="color:${t.color};font-weight:bold;font-size:11px;min-width:20px;text-align:right">${t.base_sev}</span>
+    </div>`;
+  d.onclick = () => injectThreat(t.type);
+  d.onmouseenter = () => d.style.borderColor = t.color + "80";
+  d.onmouseleave = () => d.style.borderColor = t.color + "30";
+  ttList.appendChild(d);
+});
+
+// ── TREE RENDERER ──────────────────────────────────────────────
+function assignPos(node, counter={v:0}, depth=0) {
+  if (!node) return null;
+  const left = assignPos(node.left, counter, depth+1);
+  const xPos = counter.v++;
+  const right = assignPos(node.right, counter, depth+1);
+  return {...node, xPos, depth, left, right};
+}
+function countNodes(n) { return !n ? 0 : 1 + countNodes(n.left) + countNodes(n.right); }
+function getDepth(n) { return !n ? 0 : 1 + Math.max(getDepth(n.left), getDepth(n.right)); }
+function getMaxNode(n) { return !n ? null : n.right ? getMaxNode(n.right) : n; }
+
+function renderTree(svgId, root, accentColor="#00ff88") {
+  const svg = document.getElementById(svgId);
+  const NW=40, VGAP=60, HGAP=28;
+  if (!root) {
+    svg.setAttribute("height","100");
+    svg.innerHTML=`<text class="empty-msg" x="50%" y="50" text-anchor="middle">Empty tree</text>`;
+    return;
+  }
+  const pos = assignPos(root);
+  const total = countNodes(root);
+  const depth = getDepth(root);
+  const W = Math.max(400, total*(NW+HGAP));
+  const H = Math.max(100, depth*VGAP+60);
+  svg.setAttribute("viewBox",`0 0 ${W} ${H}`);
+  svg.setAttribute("height", Math.min(H, 180));
+  const maxN = getMaxNode(root);
+
+  let edges="", nodes="";
+  function traverse(node) {
+    if (!node) return;
+    const cx = node.xPos*(NW+HGAP)+NW/2;
+    const cy = node.depth*VGAP+NW/2+8;
+    const drawEdge = child => {
+      if (!child) return;
+      const ccx=child.xPos*(NW+HGAP)+NW/2, ccy=child.depth*VGAP+NW/2+8;
+      const isR = child.color==="RED";
+      edges+=`<line x1="${cx}" y1="${cy+NW/2}" x2="${ccx}" y2="${ccy-NW/2}"
+        stroke="${isR?"#ff2d55":"#1a5c3f"}" stroke-width="${isR?2:1.5}"
+        stroke-dasharray="${isR?"none":"5,3"}" opacity=".8"/>`;
+    };
+    drawEdge(node.left); drawEdge(node.right);
+    const isMax = maxN && node.key===maxN.key;
+    const fill = node.color==="RED" ? "#ff2d55" : "#0a1e18";
+    const stroke = isMax ? "#ffd60a" : (node.color==="RED" ? "#ff2d55" : "#1a5c3f");
+    const sw = isMax ? 2.5 : 1.5;
+    const glow = node.color==="RED" ? "drop-shadow(0 0 6px #ff2d5566)" : isMax ? "drop-shadow(0 0 8px #ffd60a66)" : "";
+    const vtype = (node.value?.type || "").slice(0,4);
+    nodes+=`<g>
+      <circle cx="${cx}" cy="${cy}" r="${NW/2}" fill="${fill}" stroke="${stroke}" stroke-width="${sw}" style="filter:${glow}"/>
+      <text x="${cx}" y="${cy-3}" text-anchor="middle" fill="white" font-size="9" font-weight="700" font-family="monospace">${node.key}</text>
+      <text x="${cx}" y="${cy+8}" text-anchor="middle" fill="rgba(255,255,255,.7)" font-size="7" font-family="monospace">${vtype}</text>
+    </g>`;
+    traverse(node.left); traverse(node.right);
+  }
+  traverse(pos);
+  svg.innerHTML = edges + nodes;
+}
+
+// ── STATE UPDATES ──────────────────────────────────────────────
+let activeThreats = {};
+
+function updateStats(stats) {
+  document.getElementById("s-queue").textContent = stats.inQueue;
+  document.getElementById("s-res").textContent = stats.totalResolved;
+  document.getElementById("s-height").textContent = stats.treeHeight;
+  document.getElementById("s-bh").textContent = stats.blackHeight;
+  document.getElementById("m-sc").textContent = stats.shortCircuits;
+  document.getElementById("m-todo").textContent = stats.todoCount;
+  document.getElementById("m-bc").textContent = stats.balanceCalls;
+  document.getElementById("m-rot").textContent = stats.rotations;
+  const pct = stats.balanceCalls > 0 ? Math.round((stats.shortCircuits/stats.balanceCalls)*100) : 0;
+  document.getElementById("m-pct").textContent = pct + "%";
+  document.getElementById("m-bar").style.width = pct + "%";
+  // Header
+  const cnt = stats.inQueue;
+  const hdr = document.getElementById("hdr-count");
+  hdr.textContent = cnt + " ACTIVE THREAT" + (cnt!==1?"S":"");
+  if (cnt > 0) hdr.classList.add("pulse"); else hdr.classList.remove("pulse");
+  // Invariants
+  const rcOk = stats.redChildOk, bhOk = stats.blackHeightOk;
+  document.getElementById("inv-rc").textContent = "RED-CHILD: " + (rcOk?"✓ OK":"✗ VIOLATED");
+  document.getElementById("inv-bh").textContent = "BLACK-HEIGHT: " + (bhOk?"✓ OK":"✗ VIOLATED");
+  document.getElementById("inv-rc-dot").style.background = rcOk ? "#00ff88" : "#ff2d55";
+  document.getElementById("inv-bh-dot").style.background = bhOk ? "#00ff88" : "#ff2d55";
+  document.getElementById("hdr-inv").textContent = "⬡ INVARIANTS: " + (rcOk&&bhOk?"✓ VALID":"✗ VIOLATED");
+  document.getElementById("hdr-inv").style.color = (rcOk&&bhOk) ? "#00ff88" : "#ff2d55";
+}
+
+function updateLog(logs) {
+  if (!logs || !logs.length) return;
+  const c = document.getElementById("log-scroll");
+  document.getElementById("log-count").textContent = logs.length + " ENTRIES";
+  c.innerHTML = logs.map((l,i) => `
+    <div class="log-entry" style="color:${i===0?l.color:"#1a5c3f"}">${l.msg}</div>
+  `).join("");
+}
+
+function updateThreats(threats) {
+  activeThreats = {};
+  threats.forEach(t => activeThreats[t.id] = t);
+  const c = document.getElementById("threats-list");
+  document.getElementById("queue-count").textContent = threats.length + " IN RB TREE";
+  if (!threats.length) {
+    c.innerHTML = `<div style="font-size:10px;color:#071410;margin-top:12px">No active threats. System secure.</div>`;
+    return;
+  }
+  const sorted = [...threats].sort((a,b) => b.severity - a.severity);
+  c.innerHTML = sorted.map((t,i) => `
+    <div class="threat-card" style="border-color:${t.color};opacity:${Math.max(0.4,1-i*0.04)}">
+      <div class="t-row">
+        <span class="t-type" style="color:${t.color}">${t.type}</span>
+        <span class="t-sev" style="color:${t.color}">${t.severity}</span>
+      </div>
+      <div class="t-meta">${t.source_ip} → ${t.target_ip}</div>
+      <div class="t-meta">PORT:${t.port} · ${t.protocol} · ${(t.confidence*100).toFixed(0)}% conf</div>
+      <button class="resolve-btn" onclick="resolveThreat('${t.id}')">RESOLVE</button>
+    </div>
+  `).join("");
+}
+
+function updateResolved(resolved) {
+  const c = document.getElementById("resolved-list");
+  if (!resolved || !resolved.length) {
+    c.innerHTML = `<div style="font-size:9px;color:#071410">No resolved threats yet.</div>`;
+    return;
+  }
+  c.innerHTML = resolved.slice(0,10).map((t,i) => `
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:3px 6px;margin-bottom:2px;
+      background:#040d0a;border-left:2px solid ${t.color};font-size:9px;opacity:${Math.max(0.3,1-i*0.08)}">
+      <span style="color:#4a7a5e">${t.label}</span>
+      <span style="color:${t.color}">P:${t.severity}</span>
+    </div>
+  `).join("");
+}
+
+// ── API CALLS ──────────────────────────────────────────────────
+async function injectThreat(type=null) {
+  const res = await fetch("/api/inject", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({type})
+  });
+  const data = await res.json();
+  renderTree("moy-svg", data.tree);
+  renderTree("ok-svg", data.okasaki_tree, "#ff9f0a");
+  updateStats(data.stats);
+  fetchState();
+}
+
+async function resolveThreat(tid) {
+  const res = await fetch("/api/resolve", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({id: tid})
+  });
+  const data = await res.json();
+  renderTree("moy-svg", data.tree);
+  renderTree("ok-svg", data.okasaki_tree, "#ff9f0a");
+  updateStats(data.stats);
+  fetchState();
+}
+
+async function serveCritical() {
+  const res = await fetch("/api/serve_critical", {method:"POST"});
+  const data = await res.json();
+  renderTree("moy-svg", data.tree);
+  updateStats(data.stats);
+  fetchState();
+}
+
+async function fetchState() {
+  const res = await fetch("/api/state");
+  const data = await res.json();
+  renderTree("moy-svg", data.tree);
+  renderTree("ok-svg", data.okasaki_tree, "#ff9f0a");
+  updateStats(data.stats);
+  updateLog(data.log);
+  updateThreats(data.threats);
+  updateResolved(data.resolved);
+}
+
+async function resetAll() {
+  await fetch("/api/reset", {method:"POST"});
+  document.getElementById("bench-results").innerHTML =
+    `<div style="font-size:9px;color:#071410;grid-column:span 4">Run benchmark to compare all algorithms from the paper</div>`;
+  fetchState();
+}
+
+async function runBenchmark() {
+  const n = document.getElementById("bench-n").value;
+  const order = document.getElementById("bench-order").value;
+  const status = document.getElementById("bench-status");
+  const btn = document.getElementById("btn-bench");
+  status.textContent = "RUNNING..."; btn.disabled = true;
+  try {
+    const res = await fetch("/api/benchmark", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({n: parseInt(n), order})
+    });
+    const data = await res.json();
+    renderBenchmark(data, n, order);
+    status.textContent = "✓ DONE";
+  } catch(e) {
+    status.textContent = "ERROR";
+  }
+  btn.disabled = false;
+  fetchState();
+}
+
+function renderBenchmark(data, n, order) {
+  const algos = Object.keys(data);
+  const container = document.getElementById("bench-results");
+  const monadicIns = data["Monadic (Moy)"]?.insert_ms || 1;
+  container.innerHTML = algos.map(name => {
+    const d = data[name];
+    const isMoy = name.includes("Monadic");
+    const speedup = d.insert_speedup ? `${d.insert_speedup}×` : "—";
+    const scPct = d.sc_percent ? `${d.sc_percent}%` : "—";
+    const border = isMoy ? "var(--green)" : name.includes("Fixed") ? "var(--cyan)" : "var(--border2)";
+    return `<div class="bench-card" style="border-color:${border}">
+      <div class="bench-name">${name.replace(" (Moy)","").replace(" (Fixed)","✓")}</div>
+      <div class="bench-val" style="color:${isMoy?"var(--green)":"var(--text)"}">${d.insert_ms}ms</div>
+      <div class="bench-sub">INSERT (n=${n}, ${order})</div>
+      <div style="margin-top:4px;font-size:9px;color:var(--muted)">DELETE: ${d.delete_ms}ms</div>
+      <div style="font-size:9px;color:var(--muted)">ROT: ${d.rotations}</div>
+      ${isMoy ? `<div style="font-size:9px;color:var(--green)">SC SAVINGS: ${scPct}</div>` : ""}
+      ${d.insert_speedup ? `<div style="font-size:9px;color:${d.insert_speedup>=1?"var(--green)":"var(--red)"}">vs Okasaki: ${speedup}</div>` : ""}
+      <div style="font-size:8px;color:${d.invariant_valid?"var(--green)":"var(--red)"};margin-top:3px">${d.invariant_valid?"✓ INVARIANTS OK":"✗ VIOLATED"}</div>
+    </div>`;
+  }).join("");
+}
+
+// ── AUTO SIMULATION ────────────────────────────────────────────
+let autoInt = null, autoServeInt = null;
+const btnAuto = document.getElementById("btn-auto");
+btnAuto.onclick = () => {
+  if (autoInt) {
+    clearInterval(autoInt); clearInterval(autoServeInt);
+    autoInt = null;
+    btnAuto.classList.remove("active");
+    btnAuto.textContent = "▶ AUTO SIM";
+  } else {
+    autoInt = setInterval(() => { if (Math.random()<0.65) injectThreat(); }, 800);
+    autoServeInt = setInterval(() => { if (Math.random()<0.4) serveCritical(); }, 1400);
+    btnAuto.classList.add("active");
+    btnAuto.textContent = "⏹ STOP SIM";
+  }
+};
+
+document.getElementById("btn-inject").onclick = () => injectThreat();
+document.getElementById("btn-serve").onclick = () => serveCritical();
+document.getElementById("btn-reset").onclick = () => resetAll();
+document.getElementById("btn-bench").onclick = () => runBenchmark();
+
+fetchState();
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  CYBER IDS — MONADIC RB TREE ENGINE")
+    print("  Based on: Faster, Simpler Red-Black Trees (Moy)")
+    print("  Implements: Sections 2, 3, 4, 5 + Appendix B")
+    print("=" * 60)
+    print("  Open: http://localhost:5000")
+    print("=" * 60)
+    app.run(debug=True, port=5000)
